@@ -1,0 +1,7 @@
+# Core agent runs with zero dependencies (heuristic classifier path).
+# Install these only if you want to run tests, regenerate the calibration
+# chart, or use the real LLM classifier/persona-oracle paths.
+
+pytest>=7.0
+matplotlib>=3.5
+anthropic>=0.25.0
