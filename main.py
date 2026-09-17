@@ -13,29 +13,19 @@ CLI entrypoint.
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 from agent.classifier import HybridClassifier
+from agent.data_loading import load_emails_from_json
 from agent.executor import execute
 from agent.policy import PolicyState, decide
-from agent.schemas import Decision, Email
+from agent.schemas import Email
 
 DATA_PATH = Path(__file__).parent / "data" / "inbox_sample.json"
 
 
 def load_emails() -> list[Email]:
-    raw = json.loads(DATA_PATH.read_text())
-    emails = []
-    for r in raw:
-        gt = Decision(r["ground_truth_decision"]) if r.get("ground_truth_decision") else None
-        emails.append(Email(
-            id=r["id"], sender=r["sender"], sender_domain=r["sender_domain"],
-            subject=r["subject"], body=r["body"], known_sender=r["known_sender"],
-            thread_has_prior_context=r.get("thread_has_prior_context", False),
-            ground_truth_category=r.get("ground_truth_category"), ground_truth_decision=gt,
-        ))
-    return emails
+    return load_emails_from_json(DATA_PATH)
 
 
 def trace_email(email: Email, classifier: HybridClassifier, state: PolicyState, verbose: bool = True):

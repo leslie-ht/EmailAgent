@@ -10,6 +10,9 @@ See **[DESIGN.md](DESIGN.md)** for the full design writeup and eval
 results, and **[transcripts/examples.md](transcripts/examples.md)** for
 annotated example runs.
 
+Note: `ask_first`/`escalate` are decision *labels* that change what gets
+logged, not an implemented approval queue — see DESIGN.md §5 for why.
+
 ## Setup
 
 ```bash
@@ -48,11 +51,12 @@ pytest tests/ -v
 ```
 agent/
   schemas.py       # Email, Decision, Action, Feedback, etc.
-  classifier.py     # Hybrid LLM + heuristic classifier
-  safety_gate.py     # THE hard floor — deterministic, no learned state
-  policy.py            # Beta-Bernoulli bandit + 4-way decision combining
-  executor.py            # Mocked action execution (no real sends)
-  oracle.py                # RuleOracle + LLMPersonaOracle feedback simulators
+  data_loading.py   # Shared, validated JSON -> Email loader (main.py + eval/run_eval.py)
+  classifier.py       # Hybrid LLM + heuristic classifier
+  safety_gate.py         # THE hard floor — deterministic, no learned state
+  policy.py                 # Beta-Bernoulli bandit + 4-way decision combining
+  executor.py                  # Mocked action execution (no real sends)
+  oracle.py                      # RuleOracle + LLMPersonaOracle feedback simulators
 data/
   generate_inbox.py         # Synthetic labeled dataset generator
   inbox_sample.json           # 77 labeled emails across 11 categories
@@ -60,12 +64,13 @@ eval/
   run_eval.py                  # Multi-epoch calibration harness
   metrics.py                     # Independent safety-violation / accuracy checks
   plot_calibration.py              # Chart generation
-  results/                           # CSV + PNG output (committed as evidence)
+  results/                           # CSV + PNG + per-epoch records/confusion (committed as evidence)
 transcripts/
   examples.md                        # Curated annotated transcripts
 tests/
   test_safety_gate.py                  # Exhaustive floor tests
   test_policy.py                         # Bandit + floor-interaction tests
+  test_classifier.py                       # Heuristic rules + LLM/heuristic fallback tests
 main.py                                    # CLI entrypoint
 DESIGN.md                                    # Full design writeup
 ```

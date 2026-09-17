@@ -20,6 +20,15 @@ Four hard-coded trigger categories, per the brief:
     2. External-facing actions (new/unknown recipients)
     3. Money-related content
     4. Suspected prompt injection in the email body
+
+Plus one language-agnostic fallback (`detect_non_english`): categories 3 and
+4 above are English-keyword regexes, so a non-English email can otherwise
+walk straight around them by language choice alone rather than by evading
+the pattern. When a large share of the email looks non-English, this file
+forces a minimum of ASK_FIRST regardless of whether any regex matched --
+see `detect_non_english` for why, and DESIGN.md §7 for the residual
+limitation this doesn't solve (it can't tell a risky non-English email from
+a benign one, only that it can't tell).
 """
 
 from __future__ import annotations
@@ -105,6 +114,36 @@ def detect_money(email: Email) -> bool:
     return bool(_MONEY_RE.search(text))
 
 
+# Fraction of alphabetic characters that must be non-ASCII before we treat an
+# email as "likely non-English" for the purposes of this fallback. This is
+# deliberately crude (no real language detection dependency) -- it exists
+# only to catch the case where MONEY_PATTERNS / INJECTION_PATTERNS, being
+# English-keyword regexes, simply cannot match at all, which would otherwise
+# let a non-English money-flavored or injection email sail through with zero
+# reasons and PROCEED_SILENT.
+_NON_ENGLISH_ALPHA_RATIO = 0.3
+
+
+def detect_non_english(email: Email) -> bool:
+    """
+    Best-effort, language-agnostic signal that the regex patterns above
+    cannot be trusted for this email: if a large share of its alphabetic
+    characters are outside ASCII, none of the English-keyword regexes had a
+    realistic chance of matching, so "no pattern hit" must NOT be read as
+    "no risk." This is intentionally crude -- it does not attempt to
+    identify the language, translate, or otherwise interpret the content
+    (see the module docstring: nothing in this file should grow an LLM
+    dependency). It only decides whether the absence of a regex match is
+    meaningful evidence of safety.
+    """
+    text = f"{email.subject}{email.body}"
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return False
+    non_ascii = sum(1 for c in letters if ord(c) > 127)
+    return (non_ascii / len(letters)) > _NON_ENGLISH_ALPHA_RATIO
+
+
 def check(email: Email, proposed_action: ActionType) -> SafetyCheckResult:
     """
     Evaluate the hard safety floor for a given email + proposed action.
@@ -136,6 +175,14 @@ def check(email: Email, proposed_action: ActionType) -> SafetyCheckResult:
     if injected:
         reasons.append(f"possible prompt injection detected: '{evidence}'")
         floor = tightest(floor, Decision.ESCALATE)
+
+    if detect_non_english(email):
+        reasons.append(
+            "content is likely non-English -- the money/injection regexes above are "
+            "English-keyword-only and cannot be trusted to have caught anything, so a "
+            "conservative floor applies regardless of whether they matched"
+        )
+        floor = tightest(floor, Decision.ASK_FIRST)
 
     is_gated = len(reasons) > 0
     return SafetyCheckResult(is_gated=is_gated, min_decision=floor, reasons=reasons)

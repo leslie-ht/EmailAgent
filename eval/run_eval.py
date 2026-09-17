@@ -31,29 +31,24 @@ import random
 from pathlib import Path
 
 from agent.classifier import HybridClassifier
+from agent.data_loading import load_emails_from_json
 from agent.executor import execute
 from agent.oracle import BaseOracle, LLMPersonaOracle, RuleOracle
 from agent.policy import PolicyState, decide
-from agent.schemas import Decision, Email
-from eval.metrics import is_overautonomy_vs_ground_truth, is_safety_violation, summarize_epoch
+from agent.schemas import Email
+from eval.metrics import (
+    confusion_matrix,
+    is_overautonomy_vs_ground_truth,
+    is_safety_violation,
+    summarize_epoch,
+)
 
 DATA_PATH = Path(__file__).parent.parent / "data" / "inbox_sample.json"
 RESULTS_DIR = Path(__file__).parent / "results"
 
 
 def load_emails() -> list[Email]:
-    raw = json.loads(DATA_PATH.read_text())
-    emails = []
-    for r in raw:
-        gt = Decision(r["ground_truth_decision"]) if r.get("ground_truth_decision") else None
-        emails.append(Email(
-            id=r["id"], sender=r["sender"], sender_domain=r["sender_domain"],
-            subject=r["subject"], body=r["body"], known_sender=r["known_sender"],
-            thread_has_prior_context=r.get("thread_has_prior_context", False),
-            ground_truth_category=r.get("ground_truth_category"),
-            ground_truth_decision=gt,
-        ))
-    return emails
+    return load_emails_from_json(DATA_PATH)
 
 
 def run(oracle_name: str, epochs: int, seed: int = 7) -> list[dict]:
@@ -62,6 +57,8 @@ def run(oracle_name: str, epochs: int, seed: int = 7) -> list[dict]:
     classifier = HybridClassifier()
     state = PolicyState()
     oracle: BaseOracle = RuleOracle() if oracle_name == "rule" else LLMPersonaOracle()
+
+    RESULTS_DIR.mkdir(exist_ok=True)
 
     epoch_summaries = []
     for epoch in range(1, epochs + 1):
@@ -76,6 +73,13 @@ def run(oracle_name: str, epochs: int, seed: int = 7) -> list[dict]:
             feedback = oracle.give_feedback(email, outcome, result.bucket)
             state.record_feedback(feedback)
 
+            # Telemetry is only meaningful for THIS record's call -- guard on
+            # whether the LLM path was actually used for it, since
+            # classifier.llm/oracle carry stale values from whichever call
+            # last populated them otherwise.
+            classifier_llm_used = classification.source == "llm"
+            oracle_llm_used = isinstance(oracle, LLMPersonaOracle) and oracle.last_source_used == "llm_persona"
+
             gt = email.ground_truth_decision
             records.append({
                 "email_id": email.id,
@@ -87,6 +91,12 @@ def run(oracle_name: str, epochs: int, seed: int = 7) -> list[dict]:
                 "overautonomy_vs_gt": is_overautonomy_vs_ground_truth(result.decision, gt),
                 "classifier_source": classification.source if classification.source == "llm" else classifier.last_source_used,
                 "confidence_lower_bound": result.confidence_lower_bound,
+                "classifier_llm_latency_ms": classifier.llm.last_latency_ms if classifier_llm_used else None,
+                "classifier_llm_input_tokens": classifier.llm.last_input_tokens if classifier_llm_used else None,
+                "classifier_llm_output_tokens": classifier.llm.last_output_tokens if classifier_llm_used else None,
+                "oracle_llm_latency_ms": oracle.last_latency_ms if oracle_llm_used else None,
+                "oracle_llm_input_tokens": oracle.last_input_tokens if oracle_llm_used else None,
+                "oracle_llm_output_tokens": oracle.last_output_tokens if oracle_llm_used else None,
             })
 
         summary = summarize_epoch(records)
@@ -96,6 +106,16 @@ def run(oracle_name: str, epochs: int, seed: int = 7) -> list[dict]:
         print(f"[{oracle_name}] epoch {epoch}: ask_rate={summary['ask_rate']:.2f} "
               f"silent_rate={summary['silent_rate']:.2f} exact_match={summary['exact_match_vs_ground_truth']:.2f} "
               f"safety_violations={summary['safety_violations']} overautonomy={summary['overautonomy_vs_ground_truth']}")
+
+        # Persist per-email records (not just the epoch summary) so a bad
+        # case can be debugged, or a confusion matrix built, without
+        # re-running the whole eval. See eval/metrics.py::confusion_matrix.
+        records_path = RESULTS_DIR / f"records_epoch_{epoch}_{oracle_name}.json"
+        records_path.write_text(json.dumps(records, indent=2))
+
+        cm = confusion_matrix(records)
+        cm_path = RESULTS_DIR / f"confusion_epoch_{epoch}_{oracle_name}.json"
+        cm_path.write_text(json.dumps({gt: dict(counts) for gt, counts in cm.items()}, indent=2))
 
     return epoch_summaries
 

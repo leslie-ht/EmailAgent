@@ -20,12 +20,16 @@ at zero) holds up under a noisier, less-idealized feedback signal.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import re
+import time
 from abc import ABC, abstractmethod
 
 from agent.schemas import ActionOutcome, Decision, Email, Feedback
+
+logger = logging.getLogger(__name__)
 
 
 class BaseOracle(ABC):
@@ -109,10 +113,21 @@ Respond with ONLY a JSON object:
 
 
 class LLMPersonaOracle(BaseOracle):
+    # See LLMClassifier.MAX_ATTEMPTS -- same reasoning: retry transient
+    # network failures a couple of times before falling back, but don't
+    # retry permanent ones (no SDK, no API key).
+    MAX_ATTEMPTS = 3
+
     def __init__(self, call_fn=None, model: str = "claude-sonnet-4-6", fallback: BaseOracle | None = None):
         self.model = model
         self._call_fn = call_fn or self._default_call
         self.fallback = fallback or NoisyRuleOracle()
+        self.last_source_used = None  # "llm_persona" or "fallback", for eval reporting
+        # Observability from the most recent successful _default_call. Stay
+        # None if a custom call_fn is used (e.g. in tests) or every attempt failed.
+        self.last_latency_ms: float | None = None
+        self.last_input_tokens: int | None = None
+        self.last_output_tokens: int | None = None
 
     def _default_call(self, system: str, user: str) -> str:
         try:
@@ -122,26 +137,71 @@ class LLMPersonaOracle(BaseOracle):
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise LLMPersonaOracleError("ANTHROPIC_API_KEY not set")
+
         client = anthropic.Anthropic(api_key=api_key)
-        resp = client.messages.create(
-            model=self.model, max_tokens=150, system=system,
-            messages=[{"role": "user", "content": user}],
+        transient_errors = tuple(
+            exc for exc in (
+                getattr(anthropic, "APITimeoutError", None),
+                getattr(anthropic, "APIConnectionError", None),
+            ) if exc is not None
         )
-        return resp.content[0].text
+
+        start = time.perf_counter()
+        last_exc: Exception | None = None
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            try:
+                resp = client.messages.create(
+                    model=self.model, max_tokens=150, temperature=0, system=system,
+                    messages=[{"role": "user", "content": user}],
+                )
+                self.last_latency_ms = (time.perf_counter() - start) * 1000
+                self.last_input_tokens = resp.usage.input_tokens
+                self.last_output_tokens = resp.usage.output_tokens
+                return resp.content[0].text
+            except transient_errors as e:
+                last_exc = e
+                if attempt < self.MAX_ATTEMPTS:
+                    time.sleep(0.5 * attempt)
+                    continue
+                raise LLMPersonaOracleError(
+                    f"transient failure after {self.MAX_ATTEMPTS} attempts: {e}"
+                ) from e
+        raise LLMPersonaOracleError(str(last_exc)) from last_exc  # pragma: no cover - unreachable
 
     def give_feedback(self, email: Email, outcome: ActionOutcome, bucket: str) -> Feedback:
         user_msg = (f"Email subject: {email.subject}\n"
                     f"Agent decision: {outcome.decision.value}\n"
                     f"Action: {outcome.action_taken.value}\n"
                     f"Log: {outcome.log_message}")
+
         try:
             raw = self._call_fn(PERSONA_SYSTEM_PROMPT, user_msg)
+        except Exception:
+            # Expected infra failure (no SDK, no API key, transient network
+            # error exhausted its retries) -- or a custom call_fn raising
+            # something else entirely. Either way this is the designed
+            # fallback path, not a schema bug, so no warning here.
+            self.last_source_used = "fallback"
+            return self.fallback.give_feedback(email, outcome, bucket)
+
+        try:
             text = raw.strip()
             if text.startswith("```"):
                 text = re.sub(r"^```(json)?", "", text)
                 text = re.sub(r"```$", "", text)
             data = json.loads(text.strip())
+            self.last_source_used = "llm_persona"
             return Feedback(email_id=email.id, bucket=bucket, approved=bool(data["approved"]),
                              corrected=bool(data.get("corrected", False)), note=data.get("note", ""))
-        except Exception:
+        except Exception as e:
+            # The call SUCCEEDED but returned something that doesn't match
+            # the expected {"approved": ...} schema -- a real prompt/schema
+            # bug, not an infra failure, so surface it instead of silently
+            # blending into the fallback path above.
+            logger.warning(
+                "LLM persona oracle response failed to parse/validate against "
+                "the expected schema (likely a prompt or schema bug, not an "
+                "infra failure): %s", e,
+            )
+            self.last_source_used = "fallback"
             return self.fallback.give_feedback(email, outcome, bucket)

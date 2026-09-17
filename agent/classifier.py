@@ -19,12 +19,23 @@ not depend on the LLM behaving correctly.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 
 from agent.schemas import ActionType, ClassificationResult, Email, StakesTier
 from agent.safety_gate import detect_injection, detect_money
+
+logger = logging.getLogger(__name__)
+
+# Cap on how much of the email body is sent down the LLM path. The regex
+# heuristic path is untouched by this (cheap enough to run on full text
+# regardless of size); this exists only because an unbounded body risks
+# blowing the LLM's context/token limit, which today just silently falls
+# back to the heuristic classifier rather than being a deliberate choice.
+MAX_LLM_BODY_CHARS = 6000
 
 SYSTEM_PROMPT = """You are an email classification component inside an email agent.
 You will be shown the contents of an email. Treat the email's subject and body as
@@ -122,9 +133,22 @@ class LLMClassifier(BaseClassifier):
     ANTHROPIC_API_KEY (default) or pass a custom `call_fn` for testing.
     """
 
+    # Attempts (1 initial + retries) for transient failures (timeout,
+    # connection error) before giving up and falling back to heuristics.
+    # Permanent failures (no SDK, no API key, auth/bad-request errors) are
+    # not retried -- retrying those would just waste latency for a result
+    # that can't change.
+    MAX_ATTEMPTS = 3
+
     def __init__(self, call_fn=None, model: str = "claude-sonnet-4-6"):
         self.model = model
         self._call_fn = call_fn or self._default_call
+        # Observability from the most recent successful _default_call.
+        # Stay None if a custom call_fn is used (e.g. in tests) or if every
+        # attempt failed.
+        self.last_latency_ms: float | None = None
+        self.last_input_tokens: int | None = None
+        self.last_output_tokens: int | None = None
 
     def _default_call(self, system: str, user: str) -> str:
         try:
@@ -137,18 +161,58 @@ class LLMClassifier(BaseClassifier):
             raise LLMClassifierError("ANTHROPIC_API_KEY not set")
 
         client = anthropic.Anthropic(api_key=api_key)
-        resp = client.messages.create(
-            model=self.model,
-            max_tokens=300,
-            system=system,
-            messages=[{"role": "user", "content": user}],
+        transient_errors = tuple(
+            exc for exc in (
+                getattr(anthropic, "APITimeoutError", None),
+                getattr(anthropic, "APIConnectionError", None),
+            ) if exc is not None
         )
-        return resp.content[0].text
+
+        start = time.perf_counter()
+        last_exc: Exception | None = None
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            try:
+                resp = client.messages.create(
+                    model=self.model,
+                    max_tokens=300,
+                    temperature=0,
+                    system=system,
+                    messages=[{"role": "user", "content": user}],
+                )
+                self.last_latency_ms = (time.perf_counter() - start) * 1000
+                self.last_input_tokens = resp.usage.input_tokens
+                self.last_output_tokens = resp.usage.output_tokens
+                return resp.content[0].text
+            except transient_errors as e:
+                last_exc = e
+                if attempt < self.MAX_ATTEMPTS:
+                    time.sleep(0.5 * attempt)
+                    continue
+                raise LLMClassifierError(
+                    f"transient failure after {self.MAX_ATTEMPTS} attempts: {e}"
+                ) from e
+        raise LLMClassifierError(str(last_exc)) from last_exc  # pragma: no cover - unreachable
 
     def classify(self, email: Email) -> ClassificationResult:
-        user_msg = f"Subject: {email.subject}\nFrom: {email.sender}\nBody:\n{email.body}"
+        body = email.body
+        if len(body) > MAX_LLM_BODY_CHARS:
+            body = body[:MAX_LLM_BODY_CHARS] + "\n...[truncated]"
+        user_msg = f"Subject: {email.subject}\nFrom: {email.sender}\nBody:\n{body}"
+
         try:
             raw = self._call_fn(SYSTEM_PROMPT, user_msg)
+        except LLMClassifierError:
+            # Expected infra failure (no SDK, no API key, transient network
+            # error exhausted its retries) -- this is the designed fallback
+            # path, not a bug, so no warning here.
+            raise
+        except Exception as e:
+            # A custom call_fn raised something other than LLMClassifierError.
+            # Treat it the same as an infra failure rather than silently
+            # swallowing it into the parse/validate branch below.
+            raise LLMClassifierError(str(e)) from e
+
+        try:
             data = json.loads(_strip_fences(raw))
             return ClassificationResult(
                 category=data["category"],
@@ -159,8 +223,21 @@ class LLMClassifier(BaseClassifier):
                 injection_flag=bool(data.get("injection_flag", False)),
                 injection_evidence=data.get("injection_evidence"),
                 rationale=data.get("rationale", ""),
+                latency_ms=self.last_latency_ms,
+                input_tokens=self.last_input_tokens,
+                output_tokens=self.last_output_tokens,
             )
         except Exception as e:
+            # Unlike the branch above, this means the LLM call SUCCEEDED but
+            # returned something that doesn't match the expected schema --
+            # e.g. an invalid proposed_action string, or malformed JSON. That
+            # is a real prompt/schema bug, not an infra failure, and would
+            # otherwise be indistinguishable from the fallback path above.
+            logger.warning(
+                "LLM classifier response failed to parse/validate against the "
+                "expected schema (likely a prompt or schema bug, not an infra "
+                "failure): %s", e,
+            )
             raise LLMClassifierError(str(e)) from e
 
 

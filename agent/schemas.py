@@ -63,6 +63,10 @@ class ClassificationResult:
     injection_flag: bool = False
     injection_evidence: Optional[str] = None
     rationale: str = ""
+    # Observability for the LLM path only; stay None on the heuristic path.
+    latency_ms: Optional[float] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
 
 
 @dataclass
